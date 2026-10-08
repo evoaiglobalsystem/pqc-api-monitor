@@ -7,7 +7,6 @@ on:
 
   workflow_dispatch:
 
-# Allow the workflow to commit the daily log
 permissions:
   contents: write
 
@@ -20,8 +19,16 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # ----------------------------------------
+      # Checkout repository
+      # ----------------------------------------
+
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      # ----------------------------------------
+      # Run PQC functional self-test
+      # ----------------------------------------
 
       - name: Run PQC functional self-test
         id: pqc_test
@@ -48,13 +55,14 @@ jobs:
           echo "HTTP Status: ${HTTP_CODE}"
           echo ""
 
-          if [ -f response.json ]; then
-            echo "Response:"
-            cat response.json
-            echo ""
-          fi
+          echo "Response:"
+          cat response.json
+          echo ""
 
+          # ----------------------------------------
           # Defaults
+          # ----------------------------------------
+
           RESULT="FAIL"
           PASSED=0
           FAILED=0
@@ -63,7 +71,10 @@ jobs:
           SCORE=""
           KEY_EXCHANGE=""
 
-          # Validate response
+          # ----------------------------------------
+          # Validate JSON response
+          # ----------------------------------------
+
           if [ "${HTTP_CODE}" -eq 200 ]; then
 
             python - <<'PY' > parsed.txt
@@ -78,6 +89,7 @@ jobs:
 
               result = header.get("result", "FAIL")
               functional_result = functional.get("result", "FAIL")
+
               passed = functional.get("passed", 0)
               failed = functional.get("failed", 0)
               skipped = functional.get("skipped", 0)
@@ -86,17 +98,18 @@ jobs:
               score = ""
               key_exchange = ""
 
-              results = functional.get("checks", [])
+              checks = functional.get("checks", [])
 
-              # Find the actual scan result
-              for check in results:
+              for check in checks:
                   observed = check.get("observed", {})
                   scan_results = observed.get("results", [])
 
                   if scan_results:
                       first = scan_results[0]
+
                       if "score" in first:
                           score = first.get("score", "")
+
                       if "key_exchange" in first:
                           key_exchange = first.get("key_exchange", "")
 
@@ -146,30 +159,55 @@ jobs:
           fi
 
           # ----------------------------------------
-          # Create log directory
+          # Create logs directory
           # ----------------------------------------
 
           mkdir -p logs
 
-          LOG_FILE="logs/daily-log.csv"
-
-          # Create CSV header if required
-          if [ ! -f "${LOG_FILE}" ]; then
-            echo "date,time,status,http_status,passed,failed,skipped,duration_seconds,score,key_exchange" > "${LOG_FILE}"
-          fi
-
           # ----------------------------------------
-          # Get India date/time
+          # India date/time
           # ----------------------------------------
 
           TEST_DATE=$(TZ=Asia/Kolkata date '+%Y-%m-%d')
           TEST_TIME=$(TZ=Asia/Kolkata date '+%H:%M:%S')
 
           # ----------------------------------------
-          # Append test result
+          # Save latest full response
           # ----------------------------------------
 
+          cp response.json logs/latest-response.json
+
+          # ----------------------------------------
+          # Save dated full response
+          # ----------------------------------------
+
+          cp response.json "logs/response-${TEST_DATE}.json"
+
+          # ----------------------------------------
+          # Keep only last 3 days of JSON responses
+          # ----------------------------------------
+
+          find logs \
+            -type f \
+            -name 'response-*.json' \
+            -mtime +2 \
+            -delete
+
+          # ----------------------------------------
+          # CSV log
+          # ----------------------------------------
+
+          LOG_FILE="logs/daily-log.csv"
+
+          if [ ! -f "${LOG_FILE}" ]; then
+            echo "date,time,status,http_status,passed,failed,skipped,duration_seconds,score,key_exchange" > "${LOG_FILE}"
+          fi
+
           echo "${TEST_DATE},${TEST_TIME},${RESULT},${HTTP_CODE},${PASSED},${FAILED},${SKIPPED},${DURATION},${SCORE},${KEY_EXCHANGE}" >> "${LOG_FILE}"
+
+          # ----------------------------------------
+          # Console summary
+          # ----------------------------------------
 
           echo ""
           echo "========================================"
@@ -187,7 +225,6 @@ jobs:
           echo "Key Exchange:  ${KEY_EXCHANGE}"
           echo "========================================"
 
-          # Save result for later steps
           echo "result=${RESULT}" >> "$GITHUB_OUTPUT"
 
           # ----------------------------------------
@@ -220,19 +257,25 @@ jobs:
 
           echo "✅ PQC FUNCTIONAL TEST PASSED"
 
-      - name: Commit daily log
+      # ----------------------------------------
+      # Commit logs even if test failed
+      # ----------------------------------------
+
+      - name: Commit test logs
         if: always()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           git add logs/daily-log.csv
+          git add logs/latest-response.json
+          git add logs/response-*.json
 
           if git diff --cached --quiet; then
             echo "No log changes to commit."
             exit 0
           fi
 
-          git commit -m "chore: update daily PQC test log"
+          git commit -m "chore: update PQC test logs"
 
           git push
