@@ -7,16 +7,28 @@ on:
 
   workflow_dispatch:
 
+# Allow the workflow to commit the daily log
+permissions:
+  contents: write
+
+concurrency:
+  group: pqc-daily-test
+  cancel-in-progress: false
+
 jobs:
   functional-test:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Run PQC functional self-test
+        id: pqc_test
         env:
           PQC_API_KEY: ${{ secrets.PQC_API_KEY }}
         run: |
-          set -e
+          set +e
 
           echo "========================================"
           echo "Running PQC functional self-test"
@@ -36,74 +48,191 @@ jobs:
           echo "HTTP Status: ${HTTP_CODE}"
           echo ""
 
-          echo "Response:"
-          cat response.json
+          if [ -f response.json ]; then
+            echo "Response:"
+            cat response.json
+            echo ""
+          fi
+
+          # Defaults
+          RESULT="FAIL"
+          PASSED=0
+          FAILED=0
+          SKIPPED=0
+          DURATION="0"
+          SCORE=""
+          KEY_EXCHANGE=""
+
+          # Validate response
+          if [ "${HTTP_CODE}" -eq 200 ]; then
+
+            python - <<'PY' > parsed.txt
+          import json
+
+          try:
+              with open("response.json", "r", encoding="utf-8") as f:
+                  data = json.load(f)
+
+              header = data.get("header", {})
+              functional = data.get("functional", {})
+
+              result = header.get("result", "FAIL")
+              functional_result = functional.get("result", "FAIL")
+              passed = functional.get("passed", 0)
+              failed = functional.get("failed", 0)
+              skipped = functional.get("skipped", 0)
+              duration = functional.get("duration_seconds", 0)
+
+              score = ""
+              key_exchange = ""
+
+              results = functional.get("checks", [])
+
+              # Find the actual scan result
+              for check in results:
+                  observed = check.get("observed", {})
+                  scan_results = observed.get("results", [])
+
+                  if scan_results:
+                      first = scan_results[0]
+                      if "score" in first:
+                          score = first.get("score", "")
+                      if "key_exchange" in first:
+                          key_exchange = first.get("key_exchange", "")
+
+              if (
+                  result == "PASS"
+                  and functional_result == "PASS"
+                  and failed == 0
+                  and passed > 0
+              ):
+                  overall = "PASS"
+              else:
+                  overall = "FAIL"
+
+              print(f"RESULT={overall}")
+              print(f"PASSED={passed}")
+              print(f"FAILED={failed}")
+              print(f"SKIPPED={skipped}")
+              print(f"DURATION={duration}")
+              print(f"SCORE={score}")
+              print(f"KEY_EXCHANGE={key_exchange}")
+
+          except Exception as e:
+              print("RESULT=FAIL")
+              print("PASSED=0")
+              print("FAILED=0")
+              print("SKIPPED=0")
+              print("DURATION=0")
+              print("SCORE=")
+              print("KEY_EXCHANGE=")
+              print(f"PARSE_ERROR={e}")
+          PY
+
+            cat parsed.txt
+
+            while IFS='=' read -r key value; do
+              case "$key" in
+                RESULT) RESULT="$value" ;;
+                PASSED) PASSED="$value" ;;
+                FAILED) FAILED="$value" ;;
+                SKIPPED) SKIPPED="$value" ;;
+                DURATION) DURATION="$value" ;;
+                SCORE) SCORE="$value" ;;
+                KEY_EXCHANGE) KEY_EXCHANGE="$value" ;;
+              esac
+            done < parsed.txt
+
+          fi
+
+          # ----------------------------------------
+          # Create log directory
+          # ----------------------------------------
+
+          mkdir -p logs
+
+          LOG_FILE="logs/daily-log.csv"
+
+          # Create CSV header if required
+          if [ ! -f "${LOG_FILE}" ]; then
+            echo "date,time,status,http_status,passed,failed,skipped,duration_seconds,score,key_exchange" > "${LOG_FILE}"
+          fi
+
+          # ----------------------------------------
+          # Get India date/time
+          # ----------------------------------------
+
+          TEST_DATE=$(TZ=Asia/Kolkata date '+%Y-%m-%d')
+          TEST_TIME=$(TZ=Asia/Kolkata date '+%H:%M:%S')
+
+          # ----------------------------------------
+          # Append test result
+          # ----------------------------------------
+
+          echo "${TEST_DATE},${TEST_TIME},${RESULT},${HTTP_CODE},${PASSED},${FAILED},${SKIPPED},${DURATION},${SCORE},${KEY_EXCHANGE}" >> "${LOG_FILE}"
+
           echo ""
+          echo "========================================"
+          echo "PQC TEST SUMMARY"
+          echo "========================================"
+          echo "Date:          ${TEST_DATE}"
+          echo "Time:          ${TEST_TIME} IST"
+          echo "Status:        ${RESULT}"
+          echo "HTTP:          ${HTTP_CODE}"
+          echo "Passed:        ${PASSED}"
+          echo "Failed:        ${FAILED}"
+          echo "Skipped:       ${SKIPPED}"
+          echo "Duration:      ${DURATION} sec"
+          echo "PQC Score:     ${SCORE}"
+          echo "Key Exchange:  ${KEY_EXCHANGE}"
+          echo "========================================"
+
+          # Save result for later steps
+          echo "result=${RESULT}" >> "$GITHUB_OUTPUT"
 
           # ----------------------------------------
-          # 1. HTTP status
+          # GitHub Actions summary
           # ----------------------------------------
 
-          if [ "${HTTP_CODE}" -ne 200 ]; then
-            echo "❌ API returned HTTP ${HTTP_CODE}"
+          {
+            echo "## PQC Functional Test"
+            echo ""
+            echo "| Metric | Result |"
+            echo "|---|---:|"
+            echo "| Status | **${RESULT}** |"
+            echo "| HTTP | ${HTTP_CODE} |"
+            echo "| Passed | ${PASSED} |"
+            echo "| Failed | ${FAILED} |"
+            echo "| Skipped | ${SKIPPED} |"
+            echo "| Duration | ${DURATION} sec |"
+            echo "| PQC Score | ${SCORE} |"
+            echo "| Key Exchange | ${KEY_EXCHANGE} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # ----------------------------------------
+          # Fail workflow if test failed
+          # ----------------------------------------
+
+          if [ "${RESULT}" != "PASS" ]; then
+            echo "❌ PQC FUNCTIONAL TEST FAILED"
             exit 1
           fi
 
-          echo "✅ HTTP status = 200"
+          echo "✅ PQC FUNCTIONAL TEST PASSED"
 
-          # ----------------------------------------
-          # 2. Validate JSON and functional result
-          # ----------------------------------------
+      - name: Commit daily log
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          python - <<'PY'
-          import json
-          import sys
+          git add logs/daily-log.csv
 
-          with open("response.json", "r", encoding="utf-8") as f:
-              data = json.load(f)
+          if git diff --cached --quiet; then
+            echo "No log changes to commit."
+            exit 0
+          fi
 
-          header = data.get("header", {})
-          summary = data.get("summary", {})
-          functional = data.get("functional", {})
+          git commit -m "chore: update daily PQC test log"
 
-          result = header.get("result")
-          functional_result = functional.get("result")
-          failed = functional.get("failed", 0)
-          passed = functional.get("passed", 0)
-          skipped = functional.get("skipped", 0)
-
-          print("")
-          print("========================================")
-          print("PQC SELF-TEST VALIDATION")
-          print("========================================")
-          print(f"Header result       : {result}")
-          print(f"Functional result   : {functional_result}")
-          print(f"Checks passed       : {passed}")
-          print(f"Checks failed       : {failed}")
-          print(f"Checks skipped      : {skipped}")
-          print("")
-
-          errors = []
-
-          if result != "PASS":
-              errors.append(f"header.result = {result}")
-
-          if functional_result != "PASS":
-              errors.append(f"functional.result = {functional_result}")
-
-          if failed != 0:
-              errors.append(f"functional.failed = {failed}")
-
-          if passed == 0:
-              errors.append("No functional checks passed")
-
-          if errors:
-              print("❌ PQC FUNCTIONAL TEST FAILED")
-              for error in errors:
-                  print(f"   - {error}")
-              sys.exit(1)
-
-          print("========================================")
-          print("✅ PQC FUNCTIONAL TEST PASSED")
-          print("========================================")
-          PY
+          git push
