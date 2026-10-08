@@ -26,7 +26,7 @@ jobs:
             --output response.json \
             --write-out "%{http_code}" \
             --max-time 120 \
-            -X POST \
+            -X GET \
             "https://pqcscan.evoaiglobal.ai/api/v1/selftest/functional" \
             -H "X-API-Key: ${PQC_API_KEY}" \
             -H "Accept: application/json")
